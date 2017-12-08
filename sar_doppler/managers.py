@@ -191,6 +191,11 @@ class DatasetManager(DM):
             swath_data[i].add_band(array=fdg,
                 parameters={'name':'raw_fdg'}
             )
+            # Add antenna pattern corrected sigma0
+            swath_data[i].add_band(array=swath_data[i].corrected_sigma0(), parameters={
+                'name': 'corrected_sigma0_%s' % pol
+            })
+
 
         # calculate dc bias from land pixels of optimal subswath
         numberOfLandPixels = np.zeros(n_subswaths)
