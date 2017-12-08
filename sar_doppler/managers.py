@@ -152,6 +152,7 @@ class DatasetManager(DM):
                     'surface_backwards_doppler_centroid_frequency_shift_of_radar_wave',
                 })
             pol = swath_data[i].get_metadata(bandID=bandnum, key='polarization')
+            wavenumber = 5331004416. / 299792458. * 2 * np.pi       # ASAR
             if wind:
                 dates = [w.time_coverage_start for w in wind]
                 nearest_date = min(dates, key=lambda d:
@@ -164,27 +165,104 @@ class DatasetManager(DM):
                     'wkv':
                     'surface_backwards_doppler_frequency_shift_of_radar_wave_due_to_wind_waves'
                 })
-                fdg, land_corr = swath_data[i].geophysical_doppler_shift(wind =
-                    nansat_filename(wind[dates.index(nearest_date)].dataseturi_set.all()[0].uri))
+                fdg = swath_data[i].geophysical_doppler_shift(
+                    wind=nansat_filename(wind[dates.index(nearest_date)].dataseturi_set.all()[0].uri))
 
                 # Estimate current by subtracting wind-waves Doppler
                 theta = swath_data[i]['incidence_angle']*np.pi/180.
-                vcurrent = -np.pi*(fdg - fww)/(112.*np.sin(theta))
+                vcurrent = -np.pi*(fdg - fww)/(wavenumber * np.sin(theta))
                 ## Smooth...
                 #vcurrent = median_filter(vcurrent, size=(3,3))
                 swath_data[i].add_band(array=vcurrent,
-                        parameters={'wkv':
-                        'surface_radial_doppler_sea_water_velocity'}) 
+                        parameters={'name':'raw_Ur'})
             else:
                 fww=None
-                fdg, land_corr = swath_data[i].geophysical_doppler_shift()
+                fdg = swath_data[i].geophysical_doppler_shift()
+                # Estimate current by subtracting wind-waves Doppler
+                theta = swath_data[i]['incidence_angle']*np.pi/180.
+                vcurrent = -np.pi*(fdg)/(wavenumber * np.sin(theta))
+                vcurrent[swath_data[i]['valid_doppler']!=2] = np.nan
+                ## Smooth...
+                #vcurrent = median_filter(vcurrent, size=(3,3))
+                swath_data[i].add_band(array=vcurrent,
+                        parameters={'name':'raw_Ur'})
 
+            swath_data[i].add_band(array=fdg,
+                parameters={'name':'raw_fdg'}
+            )
+
+        # calculate dc bias from land pixels of optimal subswath
+        numberOfLandPixels = np.zeros(n_subswaths)
+        for i in range(n_subswaths):
+            t = swath_data[i].get_azimuth_time()
+            landmask = (swath_data[i]['valid_land_doppler']==1)
+            numberOfLandPixels[i] = landmask.sum()
+            dc_std = swath_data[i][swath_data[i]._get_band_number({'short_name':'dc_std'})][landmask]
+            std_thres = np.nanmedian(dc_std) + 2 * np.nanstd(dc_std)
+            pixelCoords = np.argwhere(landmask)[dc_std<=std_thres]
+            dc = swath_data[i]['raw_fdg'][pixelCoords[:,0],pixelCoords[:,1]]
+            dc = dc[np.isfinite(dc)]
+        if numberOfLandPixels.sum() != 0:
+            i_ref = np.argmax(numberOfLandPixels)
+        else:
+            i_ref = n_subswaths / 2
+        landmask = (swath_data[i_ref]['valid_land_doppler']==1)
+        dc_std = swath_data[i_ref][swath_data[i_ref]._get_band_number({'short_name':'dc_std'})][landmask]
+        std_thres = np.nanmedian(dc_std) + 2 * np.nanstd(dc_std)
+        dc_offset = np.nanmean(swath_data[i_ref]['raw_fdg'][landmask][dc_std<=std_thres])
+        
+        # calculate dc bias from land pixels of optimal subswath
+        numberOfLandPixels = np.zeros(n_subswaths)
+        for i in range(n_subswaths):
+            numberOfLandPixels[i] = (swath_data[i]['valid_land_doppler']==1).sum()
+        if numberOfLandPixels.sum() != 0:
+            i_ref = np.argmax(numberOfLandPixels)
+        else:
+            i_ref = n_subswaths / 2
+        landmask = (swath_data[i_ref]['valid_land_doppler']==1)
+        dc_std = swath_data[i_ref][swath_data[i_ref]._get_band_number({'short_name':'dc_std'})][landmask]
+        std_thres = np.nanmedian(dc_std) + 2 * np.nanstd(dc_std)
+        dc_offset = np.nanmean(swath_data[i_ref]['raw_fdg'][landmask][dc_std<=std_thres])
+
+        # calculate dc jumps between subswaths
+        d = Domain(NSR(3857), '-lle %f %f %f %f -tr 1000 1000'
+                   % (lons.min(), lats.min(), lons.max(), lats.max()))
+        geocoded_fdg = {}
+        for i in range(n_subswaths):
+            geocoded_fdg[i] = Nansat(array=np.copy(swath_data[i]['raw_fdg']), domain=swath_data[i])
+            geocoded_fdg[i].reproject(d, eResampleAlg=0, tps=True)
+        fdg_jumps = np.zeros(n_subswaths)
+        for i in range(1,n_subswaths):
+            lines, pixels = np.where((geocoded_fdg[i]['swathmask'] + geocoded_fdg[i-1]['swathmask'])==2)
+            fdg_diff = geocoded_fdg[i][1][lines,pixels] - geocoded_fdg[i-1][1][lines,pixels]
+            fdg_diff = fdg_diff[np.isfinite(fdg_diff)]
+            y,x = np.histogram(fdg_diff, bins=int(len(fdg_diff)**(1/2.)))
+            N = np.int(np.floor(sum(y!=0)**(1/3.)) * 2 + 1)
+            y_sm = np.convolve(y,np.ones(N)/N,mode='same')
+            #fdg_jumps[i] = np.mean(((x[:-1]+x[1:])/2.)[np.where(y_sm==max(y_sm))])
+            fdg_jumps[i] = np.median(((x[:-1]+x[1:])/2.)[np.where(y_sm==max(y_sm))])
+        fdg_jumps = np.cumsum(fdg_jumps)
+        fdg_jumps -= fdg_jumps[i_ref]
+        
+        # add bias-corrected bands
+        for i in range(n_subswaths):
+            fdg = swath_data[i]['raw_fdg'] - fdg_jumps[i] - dc_offset
             swath_data[i].add_band(array=fdg,
                 parameters={'wkv':
                 'surface_backwards_doppler_frequency_shift_of_radar_wave_due_to_surface_velocity'}
             )
+            if swath_data[i].has_band('fww'):
+                fww = swath_data[i]['fww']
+            else:
+                fww = 0
+            theta = swath_data[i]['incidence_angle'] * np.pi / 180.
+            vcurrent = -np.pi * (fdg-fww) / (wavenumber * np.sin(theta))
+            vcurrent[swath_data[i]['valid_doppler']!=2] = np.nan
+            swath_data[i].add_band(array=vcurrent,
+                parameters={'wkv':'surface_radial_doppler_sea_water_velocity'})
 
-            # Export data to netcdf
+        # Export data to netcdf
+        for i in range(n_subswaths):
             print('Exporting %s (subswath %d)' %(swath_data[i].fileName, i))
             fn = os.path.join(
                     ppath, 
