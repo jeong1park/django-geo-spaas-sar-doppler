@@ -19,6 +19,7 @@ from geospaas.viewer.models import Visualization
 from geospaas.viewer.models import VisualizationParameter
 from geospaas.nansat_ingestor.managers import DatasetManager as DM
 
+from nansat.nansat import Nansat
 from nansat.nsr import NSR
 from nansat.domain import Domain
 from nansat.figure import Figure
